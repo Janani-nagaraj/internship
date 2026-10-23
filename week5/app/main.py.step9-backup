@@ -1,0 +1,1074 @@
+
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException
+from fastapi.responses import FileResponse
+from minio import Minio
+from PIL import Image, ImageOps, ImageEnhance, ImageFilter
+from reportlab.pdfgen import canvas
+from reportlab.lib.pagesizes import A4
+from reportlab.lib.utils import ImageReader
+from pathlib import Path
+from datetime import datetime
+import pytesseract
+import io
+import os
+import re
+import textwrap
+
+from fastapi import Depends
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from jwt import PyJWKClient
+import jwt
+import psycopg
+
+
+# =========================================================
+# FASTAPI
+# =========================================================
+
+app = FastAPI(
+    title="Document Verification API",
+    description="Upload documents once and verify them automatically",
+    version="4.0"
+)
+
+# =========================================================
+# KEYCLOAK JWT CONFIGURATION
+# =========================================================
+
+KEYCLOAK_ISSUER = os.getenv(
+    "KEYCLOAK_ISSUER",
+    "http://localhost:8080/realms/capstone"
+)
+
+KEYCLOAK_JWKS_URL = os.getenv(
+    "KEYCLOAK_JWKS_URL",
+    "http://keycloak:8080/realms/capstone/protocol/openid-connect/certs"
+)
+
+security = HTTPBearer()
+jwks_client = PyJWKClient(KEYCLOAK_JWKS_URL)
+
+
+# =========================================================
+# KEYCLOAK JWT VERIFICATION
+# =========================================================
+
+def verify_keycloak_token(
+    credentials: HTTPAuthorizationCredentials = Depends(security)
+):
+    token = credentials.credentials
+
+    try:
+        signing_key = jwks_client.get_signing_key_from_jwt(token)
+
+        payload = jwt.decode(
+            token,
+            signing_key.key,
+            algorithms=["RS256"],
+            options={
+                "verify_exp": True,
+                "verify_iss": False,
+                "verify_aud": False
+            }
+        )
+
+        
+        return {
+            "user_id": payload.get("sub"),
+            "username": payload.get("preferred_username"),
+            "name": payload.get("name"),
+            "email": payload.get("email"),
+            "roles": payload.get("realm_access", {}).get("roles", [])
+        }
+
+
+    except jwt.PyJWTError:
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid or expired Keycloak token"
+        )
+    except Exception:
+        raise HTTPException(
+            status_code=401,
+            detail="Could not verify Keycloak token"
+        )
+
+
+# =========================================================
+# ROLE-BASED ACCESS CONTROL
+# =========================================================
+
+def require_user_or_admin(
+    user=Depends(verify_keycloak_token)
+):
+    roles = user.get("roles", [])
+
+    if "admin" not in roles and "user" not in roles:
+        raise HTTPException(
+            status_code=403,
+            detail="Access denied. Admin or user role required."
+        )
+
+    return user
+
+
+def require_admin(
+    user=Depends(verify_keycloak_token)
+):
+    roles = user.get("roles", [])
+
+    if "admin" not in roles:
+        raise HTTPException(
+            status_code=403,
+            detail="Access denied. Admin role required."
+        )
+
+    return user
+
+def require_user(
+    user=Depends(verify_keycloak_token)
+):
+    roles = user.get("roles", [])
+
+    if "user" not in roles or "admin" in roles:
+        raise HTTPException(
+            status_code=403,
+            detail="Access denied. User role required."
+        )
+
+    return user
+# =========================================================
+# MINIO CONFIGURATION
+# =========================================================
+
+DATABASE_URL = os.getenv("DATABASE_URL", "")
+
+def db_connect():
+    if not DATABASE_URL:
+        raise RuntimeError("DATABASE_URL environment variable is not configured")
+    return psycopg.connect(DATABASE_URL)
+
+
+def register_candidate_owner(candidate_id: str, keycloak_user_id: str):
+    with db_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO candidate_user_mapping (candidate_id, keycloak_user_id)
+                VALUES (%s, %s)
+                ON CONFLICT (candidate_id)
+                DO UPDATE SET keycloak_user_id = EXCLUDED.keycloak_user_id
+                WHERE candidate_user_mapping.keycloak_user_id = EXCLUDED.keycloak_user_id
+                """,
+                (candidate_id, keycloak_user_id),
+            )
+            if cur.rowcount != 1:
+                raise ValueError("Candidate ID is already linked to another Keycloak user.")
+
+
+def ensure_candidate_owner(candidate_id: str, keycloak_user_id: str):
+    with db_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT 1 FROM candidate_user_mapping
+                WHERE candidate_id = %s AND keycloak_user_id = %s
+                WHERE candidate_id = %s AND keycloak_user_id = %s
+                """,
+                (candidate_id, keycloak_user_id),
+            )
+            if cur.fetchone() is None:
+                raise HTTPException(
+                    status_code=403,
+                    detail="You are not authorized to access this candidate's documents.",
+                )
+
+
+MINIO_ENDPOINT = os.getenv("MINIO_ENDPOINT", "minio:9000")
+MINIO_ACCESS_KEY = os.getenv("MINIO_ACCESS_KEY", "minioadmin")
+MINIO_SECRET_KEY = os.getenv("MINIO_SECRET_KEY", "minioadmin123")
+MINIO_SECURE = os.getenv("MINIO_SECURE", "false").lower() == "true"
+
+BUCKET_NAME = "document-verification"
+
+minio_client = Minio(
+    MINIO_ENDPOINT,
+    access_key=MINIO_ACCESS_KEY,
+    secret_key=MINIO_SECRET_KEY,
+    secure=MINIO_SECURE
+)
+
+
+# =========================================================
+# DIRECTORIES AND CONSTANTS
+# =========================================================
+
+BASE_DIR = Path(__file__).resolve().parent.parent
+TEMP_DIR = BASE_DIR / "temporary"
+REPORT_DIR = BASE_DIR / "reports"
+
+TEMP_DIR.mkdir(parents=True, exist_ok=True)
+REPORT_DIR.mkdir(parents=True, exist_ok=True)
+
+PDF_PATH = REPORT_DIR / "report-final-result.pdf"
+
+ALLOWED_EXTENSIONS = {
+    ".png", ".jpg", ".jpeg", ".bmp",
+    ".tif", ".tiff", ".webp"
+}
+
+MAX_FILE_SIZE = 15 * 1024 * 1024
+
+pytesseract.pytesseract.tesseract_cmd = os.getenv(
+    "TESSERACT_CMD",
+    r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+)
+
+
+# =========================================================
+# MINIO HELPERS
+# =========================================================
+
+def ensure_bucket():
+    try:
+        if not minio_client.bucket_exists(BUCKET_NAME):
+            minio_client.make_bucket(BUCKET_NAME)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=503,
+            detail=f"Cannot connect to MinIO: {exc}"
+        )
+
+
+def remove_objects_with_prefix(prefix: str):
+    for obj in minio_client.list_objects(
+        BUCKET_NAME,
+        prefix=prefix,
+        recursive=True
+    ):
+        minio_client.remove_object(BUCKET_NAME, obj.object_name)
+
+
+def upload_bytes_to_minio(
+    object_name: str,
+    content: bytes,
+    content_type: str
+):
+    minio_client.put_object(
+        bucket_name=BUCKET_NAME,
+        object_name=object_name,
+        data=io.BytesIO(content),
+        length=len(content),
+        content_type=content_type
+    )
+
+
+def download_from_minio(object_name: str, destination: Path):
+    response = None
+    try:
+        response = minio_client.get_object(BUCKET_NAME, object_name)
+        destination.write_bytes(response.read())
+    finally:
+        if response is not None:
+            response.close()
+            response.release_conn()
+
+
+def find_minio_document(prefix: str):
+    objects = [
+        obj.object_name
+        for obj in minio_client.list_objects(
+            BUCKET_NAME,
+            prefix=prefix,
+            recursive=True
+        )
+        if obj.object_name.startswith(prefix)
+    ]
+
+    if len(objects) != 1:
+        return None
+
+    return objects[0]
+
+
+# =========================================================
+# IMAGE UPLOAD VALIDATION
+# =========================================================
+
+async def read_valid_image(upload: UploadFile):
+    extension = Path(upload.filename or "").suffix.lower()
+
+    if extension not in ALLOWED_EXTENSIONS:
+        raise HTTPException(
+            status_code=400,
+            detail="Upload PNG, JPG, JPEG, BMP, TIFF, or WEBP."
+        )
+
+    content = await upload.read()
+
+    if not content:
+        raise HTTPException(
+            status_code=400,
+            detail=f"{upload.filename} is empty."
+        )
+
+    if len(content) > MAX_FILE_SIZE:
+        raise HTTPException(
+            status_code=413,
+            detail="Each document must be 15 MB or smaller."
+        )
+
+    try:
+        with Image.open(io.BytesIO(content)) as image:
+            image.verify()
+    except Exception:
+        raise HTTPException(
+            status_code=400,
+            detail=f"{upload.filename} is not a valid image."
+        )
+
+    return extension, content
+
+
+# =========================================================
+# HOME
+# =========================================================
+
+@app.get("/")
+def home():
+    return {
+        "message": "Document Verification API is running",
+        "storage": "MinIO",
+        "report_0": "/report-0",
+        "report_final": "/report-final",
+        "instructions": (
+            "Upload both documents through Report 0, "
+            "then run Report Final without uploading again."
+        )
+    }
+
+
+# =========================================================
+# REPORT 0: UPLOAD DOCUMENTS
+# =========================================================
+
+
+@app.post("/report-0")
+async def report_0(
+    candidate_id: str = Form(...),
+    candidate_user_id: str = Form(...),
+    degree_certificate: UploadFile = File(...),
+    marksheet: UploadFile = File(...),
+    user=Depends(require_admin)
+):
+    # Validate the Candidate ID before using it in MinIO paths.
+    candidate_id = candidate_id.strip()
+
+    if not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", candidate_id):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Invalid Candidate ID. Use 1-64 letters, numbers, "
+                "hyphens, or underscores."
+            )
+        )
+
+    candidate_user_id = candidate_user_id.strip()
+    if not candidate_user_id:
+        raise HTTPException(status_code=400, detail="Candidate Keycloak user ID is required.")
+
+    try:
+        register_candidate_owner(candidate_id, candidate_user_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+    except Exception:
+        raise HTTPException(status_code=500, detail="Could not register candidate ownership in PostgreSQL.")
+
+    ensure_bucket()
+
+    degree_ext, degree_content = await read_valid_image(
+        degree_certificate
+    )
+    marksheet_ext, marksheet_content = await read_valid_image(
+        marksheet
+    )
+
+    candidate_prefix = f"candidates/{candidate_id}/originals/"
+
+    try:
+        # Replace only this candidate's previous source documents.
+        remove_objects_with_prefix(candidate_prefix)
+
+        degree_key = (
+            f"{candidate_prefix}degree_certificate{degree_ext}"
+        )
+        marksheet_key = (
+            f"{candidate_prefix}marksheet{marksheet_ext}"
+        )
+
+        upload_bytes_to_minio(
+            degree_key,
+            degree_content,
+            "image/" + degree_ext.lstrip(".")
+        )
+
+        upload_bytes_to_minio(
+            marksheet_key,
+            marksheet_content,
+            "image/" + marksheet_ext.lstrip(".")
+        )
+
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Could not save documents to MinIO: {exc}"
+        )
+
+    return {
+        "message": "Both documents uploaded successfully",
+        "candidate_id": candidate_id,
+        "storage": "MinIO",
+        "bucket": BUCKET_NAME,
+        "degree_certificate": degree_key,
+        "marksheet": marksheet_key,
+        "next_step": (
+            "Run POST /report-final with the same Candidate ID."
+        )
+    }
+
+
+# =========================================================
+# OCR WITH IMAGE PREPROCESSING
+# =========================================================
+
+def extract_text_from_image(image_path: Path) -> str:
+    """
+    Run OCR on the original image and enhanced variants.
+    Combine the OCR results so extraction can use more than one pass.
+    """
+
+    with Image.open(image_path) as original:
+        image = ImageOps.exif_transpose(original).convert("RGB")
+
+    # Upscale small images to improve text recognition.
+    if image.width < 1800:
+        scale = 1800 / image.width
+        image = image.resize(
+            (1800, int(image.height * scale)),
+            Image.Resampling.LANCZOS
+        )
+
+    gray = ImageOps.grayscale(image)
+    gray = ImageOps.autocontrast(gray)
+    gray = ImageEnhance.Contrast(gray).enhance(1.5)
+
+    # Produce a second, thresholded version for faded text.
+    thresholded = gray.point(
+        lambda pixel: 255 if pixel > 165 else 0
+    )
+
+    variants = [image, gray, thresholded]
+    results = []
+
+    for variant in variants:
+        for page_mode in (6, 11):
+            try:
+                text = pytesseract.image_to_string(
+                    variant,
+                    config=f"--oem 3 --psm {page_mode}"
+                )
+                if text.strip():
+                    results.append(text.strip())
+            except Exception:
+                continue
+
+    if not results:
+        raise RuntimeError(
+            "Tesseract could not extract text. Check its installation "
+            "and TESSERACT_CMD setting."
+        )
+
+    # Preserve the individual OCR passes for the extraction functions.
+    return "\n".join(results)
+
+
+# =========================================================
+# CLEAN OCR TEXT
+# =========================================================
+
+def clean_ocr_value(value: str) -> str:
+    if not value:
+        return ""
+
+    value = value.replace("|", "I")
+    value = re.sub(r"\s+", " ", value).strip()
+
+    # Remove common watermark and layout words accidentally attached
+    # to a name by OCR. These are not candidate-name components.
+    noise_words = (
+        r"\b(?:DOCUMENT|SPECIMEN|SAMPLE|UNIVERSITY|"
+        r"CONTROLLER|EXAMINATIONS|SIGNATURE)\b"
+    )
+
+    value = re.sub(noise_words, " ", value, flags=re.IGNORECASE)
+
+    # Stop before unrelated field labels if OCR merges several fields.
+    stop_labels = (
+        r"\b(?:register\s*(?:no|number)|reg\s*(?:no|number)|"
+        r"roll\s*(?:no|number)|date\s+of\s+issue|"
+        r"certificate\s+no|programme\s+period|"
+        r"programme|program|class|result|percentage|"
+        r"cgpa|subject|marks)\b"
+    )
+
+    value = re.split(
+        stop_labels, value, maxsplit=1, flags=re.IGNORECASE
+    )[0]
+
+    value = re.sub(r"[^A-Za-z\s.'-]", " ", value)
+    value = re.sub(r"\s+", " ", value).strip(" .'-")
+
+    # Remove label fragments that OCR may leave at the beginning.
+    value = re.sub(
+        r"^(?:(?:of|the|name|candidate|student)\s+)+",
+        "",
+        value,
+        flags=re.IGNORECASE
+    ).strip()
+
+    # Names should have at least two alphabetic characters.
+    if len(re.sub(r"[^A-Za-z]", "", value)) < 2:
+        return ""
+
+    return value
+
+
+# =========================================================
+# EXTRACT CANDIDATE NAME
+# =========================================================
+
+def extract_candidate_name(text: str):
+    """
+    Handles common layouts such as:
+      Name of Candidate: ARUN KUMAR R
+      Candidate Name: ARUN KUMAR R
+      This is to certify that
+      ARUN KUMAR R
+    """
+
+    lines = [
+        re.sub(r"\s+", " ", line).strip()
+        for line in text.splitlines()
+        if line.strip()
+    ]
+
+    # First preference: explicit candidate/student name labels.
+    label_patterns = [
+        r"name\s+of\s+(?:the\s+)?candidate",
+        r"name\s+of\s+(?:the\s+)?student",
+        r"candidate\s+name",
+        r"student\s+name",
+    ]
+
+    for index, line in enumerate(lines):
+        for label in label_patterns:
+            match = re.search(
+                rf"\b{label}\b\s*[:\-]?\s*(.*)$",
+                line,
+                re.IGNORECASE
+            )
+
+            if not match:
+                continue
+
+            value = match.group(1).strip()
+
+            # If the OCR separated the label and name, inspect the
+            # next line too.
+            if not value and index + 1 < len(lines):
+                value = lines[index + 1]
+
+            cleaned = clean_ocr_value(value)
+
+            if cleaned:
+                return cleaned
+
+    # Second preference: degree certificate wording.
+    # The name often appears after "This is to certify that".
+    for index, line in enumerate(lines):
+        if re.search(
+            r"this\s+is\s+to\s+certify\s+that",
+            line,
+            re.IGNORECASE
+        ):
+            remainder = re.sub(
+                r".*?this\s+is\s+to\s+certify\s+that",
+                "",
+                line,
+                flags=re.IGNORECASE
+            ).strip(" :-")
+
+            candidates = []
+
+            if remainder:
+                candidates.append(remainder)
+
+            if index + 1 < len(lines):
+                candidates.append(lines[index + 1])
+
+            for candidate in candidates:
+                cleaned = clean_ocr_value(candidate)
+
+                if cleaned and not re.search(
+                    r"\b(?:has successfully|register|number|"
+                    r"completed|fulfilled|requirements)\b",
+                    cleaned,
+                    re.IGNORECASE
+                ):
+                    return cleaned
+
+    # Third preference: OCR may detect "Candidate ARUN KUMAR R"
+    # without the "Name of" part.
+    for line in lines:
+        match = re.search(
+            r"\bcandidate\b\s*[:\-]?\s*(.+)$",
+            line,
+            re.IGNORECASE
+        )
+
+        if match:
+            cleaned = clean_ocr_value(match.group(1))
+            if cleaned:
+                return cleaned
+
+    return None
+
+
+# =========================================================
+# EXTRACT REGISTER NUMBER
+# =========================================================
+
+def extract_register_number(text: str):
+    patterns = [
+        r"(?:register\s*(?:no|number)|reg\s*(?:no|number))"
+        r"\s*[:#\-]?\s*([A-Za-z0-9][A-Za-z0-9/\-]{2,})",
+
+        r"(?:roll\s*(?:no|number))"
+        r"\s*[:#\-]?\s*([A-Za-z0-9][A-Za-z0-9/\-]{2,})",
+
+        r"(?:enrolment|enrollment)\s*(?:no|number)"
+        r"\s*[:#\-]?\s*([A-Za-z0-9][A-Za-z0-9/\-]{2,})"
+    ]
+
+    for pattern in patterns:
+        match = re.search(pattern, text, re.IGNORECASE)
+
+        if match:
+            value = re.sub(r"[^A-Za-z0-9]", "", match.group(1))
+            return value.upper()
+
+    return None
+
+
+# =========================================================
+# NORMALIZE VALUES FOR COMPARISON
+# =========================================================
+
+def normalize_name(value):
+    if not value:
+        return None
+
+    return re.sub(r"[^a-z]", "", value.lower())
+
+
+def normalize_register(value):
+    if not value:
+        return None
+
+    return re.sub(r"[^A-Za-z0-9]", "", value).upper()
+
+
+# =========================================================
+# VERIFY BOTH DOCUMENTS
+# =========================================================
+
+def documents_match(degree_text: str, marksheet_text: str):
+    degree_name = extract_candidate_name(degree_text)
+    marksheet_name = extract_candidate_name(marksheet_text)
+
+    degree_register = extract_register_number(degree_text)
+    marksheet_register = extract_register_number(marksheet_text)
+
+    findings = []
+    actual_mismatches = []
+    missing_fields = []
+
+    # ---- Candidate name checks ----
+
+    if not degree_name:
+        missing_fields.append("Degree certificate candidate name")
+        findings.append(
+            "Candidate name could not be reliably detected "
+            "in the degree certificate."
+        )
+
+    if not marksheet_name:
+        missing_fields.append("Marksheet candidate name")
+        findings.append(
+            "Candidate name could not be reliably detected in the marksheet."
+        )
+
+    if degree_name and marksheet_name:
+        degree_normalized = normalize_name(degree_name)
+        marksheet_normalized = normalize_name(marksheet_name)
+
+        if degree_normalized != marksheet_normalized:
+            actual_mismatches.append("Candidate name")
+
+            findings.append(
+                "Candidate names differ: degree certificate says "
+                f"'{degree_name}', while marksheet says "
+                f"'{marksheet_name}'."
+            )
+        else:
+            findings.append(
+                f"Candidate name matches: '{degree_name}' and "
+                f"'{marksheet_name}'."
+            )
+
+    # ---- Register number checks ----
+
+    if not degree_register:
+        missing_fields.append("Degree certificate register number")
+        findings.append(
+            "Register number could not be detected in the degree certificate."
+        )
+
+    if not marksheet_register:
+        missing_fields.append("Marksheet register number")
+        findings.append(
+            "Register number could not be detected in the marksheet."
+        )
+
+    if degree_register and marksheet_register:
+        if normalize_register(degree_register) != normalize_register(
+            marksheet_register
+        ):
+            actual_mismatches.append("Register number")
+
+            findings.append(
+                "Register numbers differ: degree certificate has "
+                f"'{degree_register}', while marksheet has "
+                f"'{marksheet_register}'."
+            )
+        else:
+            findings.append(
+                f"Register number matches: '{degree_register}'."
+            )
+
+    # ---- Three distinct verification outcomes ----
+
+    if actual_mismatches:
+        status = "MISMATCH"
+        status_label = "MISMATCH FOUND"
+        reason = (
+            "One or more extracted fields differ between the documents. "
+            "Review the findings below."
+        )
+
+    elif missing_fields:
+        status = "UNABLE_TO_VERIFY"
+        status_label = "UNABLE TO VERIFY - INFORMATION MISSING"
+        reason = (
+            "One or more required fields could not be reliably extracted. "
+            "This is not automatically a mismatch. Review the source images "
+            "and OCR results."
+        )
+
+    else:
+        status = "MATCH"
+        status_label = "FIELDS MATCH"
+        reason = (
+            "The extracted candidate names and register numbers match "
+            "across both documents. This comparison does not establish "
+            "document authenticity."
+        )
+
+    return {
+        "status": status,
+        "status_label": status_label,
+        "reason": reason,
+        "degree_name": degree_name,
+        "marksheet_name": marksheet_name,
+        "degree_register": degree_register,
+        "marksheet_register": marksheet_register,
+        "findings": findings,
+        "actual_mismatches": actual_mismatches,
+        "missing_fields": missing_fields
+    }
+
+
+# =========================================================
+# ADD DOCUMENT IMAGE TO PDF
+# =========================================================
+
+def add_image_to_pdf(pdf, image_path: Path):
+    page_width, page_height = A4
+
+    with Image.open(image_path) as original:
+        image = ImageOps.exif_transpose(original).convert("RGB")
+        image_width, image_height = image.size
+
+        max_width = page_width - 40
+        max_height = page_height - 70
+
+        scale = min(
+            max_width / image_width,
+            max_height / image_height
+        )
+
+        width = image_width * scale
+        height = image_height * scale
+
+        x = (page_width - width) / 2
+        y = (page_height - height) / 2
+
+        pdf.drawImage(
+            ImageReader(image),
+            x, y,
+            width=width,
+            height=height,
+            preserveAspectRatio=True,
+            mask="auto"
+        )
+
+    pdf.showPage()
+
+
+# =========================================================
+# PDF TEXT WRAPPING
+# =========================================================
+
+def draw_wrapped_text(
+    pdf,
+    value: str,
+    x: int,
+    y: int,
+    width: int = 90,
+    line_height: int = 15
+):
+    lines = textwrap.wrap(
+        str(value),
+        width=width,
+        break_long_words=True
+    ) or [""]
+
+    for line in lines:
+        if y < 50:
+            pdf.showPage()
+            pdf.setFont("Helvetica", 10)
+            y = A4[1] - 50
+
+        pdf.drawString(x, y, line)
+        y -= line_height
+
+    return y
+
+
+# =========================================================
+# PDF VERIFICATION STATUS PAGE
+# =========================================================
+
+def add_status_page(pdf, result):
+    page_width, page_height = A4
+
+    pdf.setTitle("Document Verification Report")
+
+    pdf.setFont("Helvetica-Bold", 17)
+    pdf.drawCentredString(
+        page_width / 2,
+        page_height - 50,
+        "DOCUMENT VERIFICATION REPORT"
+    )
+
+    pdf.setFont("Helvetica", 10)
+    pdf.drawString(
+        45,
+        page_height - 78,
+        "Generated: " + datetime.now().strftime("%d-%m-%Y %H:%M:%S")
+    )
+
+    y = page_height - 115
+
+    pdf.setFont("Helvetica-Bold", 13)
+    y = draw_wrapped_text(
+        pdf,
+        "STATUS: " + result["status_label"],
+        45, y, width=75, line_height=18
+    )
+
+    y -= 12
+    pdf.setFont("Helvetica-Bold", 12)
+    pdf.drawString(45, y, "Extracted Candidate Details")
+    y -= 22
+
+    pdf.setFont("Helvetica", 10)
+
+    fields = [
+        (
+            "Degree certificate candidate name",
+            result["degree_name"]
+        ),
+        (
+            "Marksheet candidate name",
+            result["marksheet_name"]
+        ),
+        (
+            "Degree certificate register number",
+            result["degree_register"]
+        ),
+        (
+            "Marksheet register number",
+            result["marksheet_register"]
+        )
+    ]
+
+    for label, value in fields:
+        y = draw_wrapped_text(
+            pdf,
+            f"{label}: {value or 'Not detected'}",
+            45, y
+        )
+
+    y -= 10
+    pdf.setFont("Helvetica-Bold", 12)
+    pdf.drawString(45, y, "Verification Findings")
+    y -= 22
+
+    pdf.setFont("Helvetica", 10)
+
+    for index, finding in enumerate(result["findings"], start=1):
+        y = draw_wrapped_text(
+            pdf,
+            f"{index}. {finding}",
+            45, y
+        )
+        y -= 6
+
+    y -= 10
+    pdf.setFont("Helvetica-Bold", 11)
+    pdf.drawString(45, y, "Summary")
+    y -= 20
+
+    pdf.setFont("Helvetica", 10)
+    y = draw_wrapped_text(
+        pdf,
+        result["reason"],
+        45, y
+    )
+
+    y -= 12
+    pdf.setFont("Helvetica-Bold", 10)
+    draw_wrapped_text(
+        pdf,
+        "Important: Matching fields do not prove that a document is genuine. "
+        "This report performs an OCR-based comparison only.",
+        45, y, width=85
+    )
+
+    pdf.showPage()
+
+
+# =========================================================
+# REPORT FINAL: DOWNLOAD, COMPARE, GENERATE PDF
+# =========================================================
+
+
+@app.post("/report-final")
+def report_final(
+    candidate_id: str = Form(...),
+   user=Depends(require_user)
+):
+    candidate_id = candidate_id.strip()
+
+    if not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", candidate_id):
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid Candidate ID."
+        )
+
+    ensure_bucket()
+
+    candidate_prefix = f"candidates/{candidate_id}/originals/"
+
+    try:
+        degree_key = find_minio_document(
+            f"{candidate_prefix}degree_certificate"
+        )
+        marksheet_key = find_minio_document(
+            f"{candidate_prefix}marksheet"
+        )
+    except Exception as exc:
+        raise HTTPException(
+            status_code=503,
+            detail=f"Could not retrieve documents from MinIO: {exc}"
+        )
+
+    if not degree_key or not marksheet_key:
+        raise HTTPException(
+            status_code=404,
+            detail=(
+                f"Documents not found for candidate {candidate_id}. "
+                "Check the Candidate ID and upload both documents first."
+            )
+        )
+
+    degree_path = TEMP_DIR / f"{candidate_id}-degree{Path(degree_key).suffix}"
+    marksheet_path = TEMP_DIR / f"{candidate_id}-marksheet{Path(marksheet_key).suffix}"
+    candidate_pdf_path = TEMP_DIR / f"{candidate_id}-report-final-result.pdf"
+
+    try:
+        download_from_minio(degree_key, degree_path)
+        download_from_minio(marksheet_key, marksheet_path)
+
+        degree_text = extract_text_from_image(degree_path)
+        marksheet_text = extract_text_from_image(marksheet_path)
+
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Document download or OCR failed: {exc}"
+        )
+
+    result = documents_match(degree_text, marksheet_text)
+
+    try:
+        pdf = canvas.Canvas(str(candidate_pdf_path), pagesize=A4)
+        add_image_to_pdf(pdf, degree_path)
+        add_image_to_pdf(pdf, marksheet_path)
+        add_status_page(pdf, result)
+        pdf.save()
+
+        report_key = (
+            f"candidates/{candidate_id}/reports/"
+            "report-final-result.pdf"
+        )
+
+        upload_bytes_to_minio(
+            report_key,
+            candidate_pdf_path.read_bytes(),
+            "application/pdf"
+        )
+
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Could not generate or store the PDF: {exc}"
+        )
+
+    return FileResponse(
+        path=str(candidate_pdf_path),
+        media_type="application/pdf",
+        filename=f"{candidate_id}-report-final-result.pdf"
+    )
+
