@@ -1,0 +1,9 @@
+fastapi
+uvicorn
+minio
+Pillow
+reportlab
+pytesseract
+python-multipart
+psycopg[binary]
+PyJWT[crypto]

@@ -1,0 +1,71 @@
+name: capstone
+
+services:
+
+  db:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: ${DB_USER}
+      POSTGRES_PASSWORD: ${DB_PASSWORD}
+      POSTGRES_DB: ${DB_NAME}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./db/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER} -d ${DB_NAME}"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+
+  minio:
+    image: cgr.dev/chainguard/minio:latest
+    user: '0:0'
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ACCESS_KEY}
+      MINIO_ROOT_PASSWORD: ${MINIO_SECRET_KEY}
+    volumes:
+      - miniodata:/data
+    ports:
+      - "9001:9001"
+    restart: unless-stopped
+
+  keycloak:
+    image: quay.io/keycloak/keycloak:26.8.0
+    command: start-dev --import-realm
+    environment:
+      KC_BOOTSTRAP_ADMIN_USERNAME: ${KC_ADMIN}
+      KC_BOOTSTRAP_ADMIN_PASSWORD: ${KC_ADMIN_PASSWORD}
+    volumes:
+      - kcdata:/opt/keycloak/data
+      - ./keycloak:/opt/keycloak/data/import:ro
+    ports:
+      - "8080:8080"
+    restart: unless-stopped
+
+  backend:
+    build: .
+    environment:
+      DATABASE_URL: postgresql://${DB_USER}:${DB_PASSWORD}@db:5432/${DB_NAME}
+      MINIO_ENDPOINT: minio:9000
+      MINIO_ACCESS_KEY: ${MINIO_ACCESS_KEY}
+      MINIO_SECRET_KEY: ${MINIO_SECRET_KEY}
+      MINIO_SECURE: "false"
+      KEYCLOAK_JWKS_URL: http://keycloak:8080/realms/${KC_REALM}/protocol/openid-connect/certs
+      KEYCLOAK_ISSUER: http://localhost:8080/realms/${KC_REALM}
+    ports:
+      - "8002:8000"
+    depends_on:
+      db:
+        condition: service_healthy
+      minio:
+        condition: service_started
+      keycloak:
+        condition: service_started
+    restart: unless-stopped
+
+volumes:
+  pgdata:
+  miniodata:
+  kcdata:

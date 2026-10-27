@@ -1,0 +1,25 @@
+venv/
+.venv/
+__pycache__/
+*.py[cod]
+.env
+uploads/
+reports/
+temporary/
+
+# Sensitive files and local outputs
+.env.*
+!.env.example
+headers.txt
+report.pdf
+
+# Backup files
+*.backup
+*.bak
+main_backup_*.py
+
+# Local testing scripts containing credentials or temporary code
+get-token.ps1
+test.py
+show-candidate-id.ps1
+keycloak/capstone-realm.json
