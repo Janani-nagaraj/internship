@@ -3,7 +3,7 @@ from fastapi import Depends, HTTPException
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from jwt import PyJWKClient
 
-from config import KEYCLOAK_JWKS_URL
+from app.core.config import KEYCLOAK_JWKS_URL
 
 security = HTTPBearer()
 jwks_client = PyJWKClient(KEYCLOAK_JWKS_URL)

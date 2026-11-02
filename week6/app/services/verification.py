@@ -1,6 +1,6 @@
 import re
 
-from ocr import extract_candidate_name, extract_register_number
+from app.services.ocr import extract_candidate_name, extract_register_number
 
 
 def normalize_name(value):

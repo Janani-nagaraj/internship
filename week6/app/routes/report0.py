@@ -1,10 +1,10 @@
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
 
-from auth import require_admin
-from config import BUCKET_NAME
-from database import register_candidate_owner
-from storage import ensure_bucket, remove_objects_with_prefix, upload_bytes_to_minio
-from utils import clean_candidate_id, originals_prefix, read_valid_image
+from app.core.security import require_admin
+from app.core.config import BUCKET_NAME
+from app.db.ownership import register_candidate_owner
+from app.services.storage import ensure_bucket, remove_objects_with_prefix, upload_bytes_to_minio
+from app.services.validation import clean_candidate_id, originals_prefix, read_valid_image
 
 router = APIRouter()
 

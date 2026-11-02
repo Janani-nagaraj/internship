@@ -1,13 +1,6 @@
-import psycopg
 from fastapi import HTTPException
 
-from config import DATABASE_URL
-
-
-def db_connect():
-    if not DATABASE_URL:
-        raise RuntimeError("DATABASE_URL environment variable is not configured")
-    return psycopg.connect(DATABASE_URL)
+from app.db.connection import db_connect
 
 
 def register_candidate_owner(candidate_id: str, keycloak_user_id: str):

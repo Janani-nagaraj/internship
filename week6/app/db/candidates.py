@@ -1,4 +1,4 @@
-from database import db_connect
+from app.db.connection import db_connect
 
 COLUMNS = "candidate_id, full_name, email, status, created_at"
 

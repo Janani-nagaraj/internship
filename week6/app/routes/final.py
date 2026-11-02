@@ -3,14 +3,14 @@ from pathlib import Path
 from fastapi import APIRouter, Depends, Form, HTTPException
 from fastapi.responses import FileResponse
 
-from auth import require_user
-from config import TEMP_DIR
-from database import ensure_candidate_owner
-from ocr import extract_text_from_image
-from pdf_report import build_report_pdf
-from storage import download_from_minio, ensure_bucket, find_minio_document, upload_bytes_to_minio
-from utils import clean_candidate_id, originals_prefix
-from verification import documents_match
+from app.core.security import require_user
+from app.core.config import TEMP_DIR
+from app.db.ownership import ensure_candidate_owner
+from app.services.ocr import extract_text_from_image
+from app.services.pdf_report import build_report_pdf
+from app.services.storage import download_from_minio, ensure_bucket, find_minio_document, upload_bytes_to_minio
+from app.services.validation import clean_candidate_id, originals_prefix
+from app.services.verification import documents_match
 
 router = APIRouter()
 

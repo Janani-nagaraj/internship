@@ -4,7 +4,7 @@ from pathlib import Path
 from fastapi import HTTPException
 from minio import Minio
 
-from config import (
+from app.core.config import (
     BUCKET_NAME, MINIO_ACCESS_KEY, MINIO_ENDPOINT, MINIO_SECRET_KEY, MINIO_SECURE,
 )
 

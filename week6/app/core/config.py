@@ -21,7 +21,7 @@ MINIO_SECURE = os.getenv("MINIO_SECURE", "false").lower() == "true"
 BUCKET_NAME = "document-verification"
 
 # ---------- Folders ----------
-BASE_DIR = Path(os.getenv("BASE_DIR", Path(__file__).resolve().parent.parent))
+BASE_DIR = Path(os.getenv("BASE_DIR", Path(__file__).resolve().parents[2]))
 TEMP_DIR = BASE_DIR / "temporary"
 REPORT_DIR = BASE_DIR / "reports"
 TEMP_DIR.mkdir(parents=True, exist_ok=True)

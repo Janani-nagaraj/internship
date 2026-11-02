@@ -5,7 +5,7 @@ from pathlib import Path
 from fastapi import HTTPException, UploadFile
 from PIL import Image
 
-from config import ALLOWED_EXTENSIONS, MAX_FILE_SIZE
+from app.core.config import ALLOWED_EXTENSIONS, MAX_FILE_SIZE
 
 CANDIDATE_ID_PATTERN = r"[A-Za-z0-9_-]{1,64}"
 
