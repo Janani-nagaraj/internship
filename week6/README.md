@@ -43,12 +43,14 @@ app/
   services/
     storage.py            MinIO upload, download, find, delete
     validation.py         candidate id and image checks
+    body_parser.py        reads and validates a JSON request body (JSON only)
+    response_format.py    answers in JSON or XML, as the client asks
     ocr.py                image cleaning and text extraction (Tesseract)
     verification.py       compares the two documents
     pdf_report.py         builds the 3-page PDF
   routes/
     home.py               GET /
-    candidates.py         CRUD endpoints (admin)
+    candidates.py         CRUD endpoints (admin); PUT answers JSON or XML
     report0.py            POST /report-0 (admin uploads documents)
     final.py              POST /report-final (candidate gets the report)
 ```
@@ -121,12 +123,47 @@ In Swagger click **Authorize** and paste the token without the word `Bearer`. To
 | POST | `/candidates` | admin | 201 | 401, 403, 409 duplicate, 422 bad body, 400 bad id |
 | GET | `/candidates` | admin | 200 | 401, 403 |
 | GET | `/candidates/{id}` | admin | 200 | 401, 403, 404 |
-| PUT | `/candidates/{id}` | admin | 200 | 401, 403, 404, 422 |
+| PUT | `/candidates/{id}` | admin | 200 (JSON or XML) | 400 broken JSON, 400 bad `format`, 401, 403, 404, 406 `Accept` not supported, 415 body is not JSON, 422 |
 | DELETE | `/candidates/{id}` | admin | 204 | 401, 403, 404 |
 | POST | `/report-0` | admin | 200 | 400, 401, 403, 409 id owned by another user, 413 file too big |
 | POST | `/report-final` | candidate (role `user`) | 200 PDF | 401, 403 not your id, 404 not registered, 503 storage down |
 
 Usage order for the report: the admin calls `/report-0` with `candidate_id`, `candidate_user_id` (the candidate's Keycloak id) and two images; then the candidate calls `/report-final` with the same `candidate_id`.
+
+## PUT: input is JSON, output is JSON or XML
+
+`PUT /candidates/{id}` accepts **JSON only** as input (`Content-Type: application/json`). Any other body type returns 415.
+
+The **answer** can be JSON or XML, and the client chooses in one of two ways:
+
+| How | Example | Result |
+|---|---|---|
+| `Accept` header | `Accept: application/xml` | XML (also `text/xml`) |
+| `Accept` header | `Accept: application/json` | JSON |
+| query parameter | `?format=xml` or `?format=json` | wins over the `Accept` header |
+| nothing given | | JSON (the default) |
+
+Request body (always JSON):
+
+```json
+{"full_name": "Janani Nagaraj", "email": "janani@example.com", "status": "VERIFIED"}
+```
+
+XML answer:
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<candidate><candidate_id>C070</candidate_id><full_name>Janani Nagaraj</full_name><email>janani@example.com</email><status>VERIFIED</status><created_at>2026-11-05T10:15:00+00:00</created_at></candidate>
+```
+
+Examples:
+
+```bash
+curl -X PUT "http://localhost:8002/candidates/C070?format=xml" -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" -d '{"full_name":"Janani Nagaraj","email":"janani@example.com","status":"VERIFIED"}'
+curl -X PUT "http://localhost:8002/candidates/C070" -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" -H "Accept: application/xml" -d '{"full_name":"Janani Nagaraj","email":"janani@example.com","status":"VERIFIED"}'
+```
+
+Error answers (401, 404, 422 and so on) are always JSON.
 
 ## Commands
 
