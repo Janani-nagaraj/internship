@@ -1,4 +1,6 @@
-from fastapi import APIRouter, Depends, HTTPException, Request, Response
+from typing import Literal, Optional
+
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 from fastapi.concurrency import run_in_threadpool
 
 import app.db.candidates as store
@@ -10,6 +12,28 @@ from app.services.validation import clean_candidate_id
 
 router = APIRouter(prefix="/candidates", tags=["Candidates (CRUD)"])
 
+XML_DOCS = {
+    "schema": {
+        "type": "object",
+        "xml": {"name": "candidate"},
+        "properties": {
+            "candidate_id": {"type": "string"},
+            "full_name": {"type": "string"},
+            "email": {"type": "string"},
+            "status": {"type": "string"},
+            "phone_number": {"type": "string"},
+            "created_at": {"type": "string"},
+        },
+    },
+    "example": (
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        "<candidate><candidate_id>C070</candidate_id><full_name>Janani Nagaraj</full_name>"
+        "<email>janani@example.com</email><status>VERIFIED</status>"
+        "<phone_number>+919876543298</phone_number>"
+        "<created_at>2026-11-05T10:15:00+00:00</created_at></candidate>"
+    ),
+}
+
 # Tells Swagger: the request body is JSON only, the answer can be JSON or XML
 PUT_DOCS = {
     "requestBody": {
@@ -17,7 +41,12 @@ PUT_DOCS = {
         "content": {
             "application/json": {
                 "schema": CandidateUpdate.model_json_schema(),
-                "example": {"full_name": "Janani Nagaraj", "email": "janani@example.com", "status": "VERIFIED"},
+                "example": {
+                    "full_name": "Janani Nagaraj",
+                    "email": "janani@example.com",
+                    "phone_number": "+919876543298",
+                    "status": "VERIFIED",
+                },
             }
         },
     },
@@ -26,18 +55,22 @@ PUT_DOCS = {
             "description": "The updated candidate, as JSON or XML (choose with the Accept header or ?format=)",
             "content": {
                 "application/json": {"schema": CandidateOut.model_json_schema()},
-                "application/xml": {
-                    "schema": {"type": "string"},
-                    "example": (
-                        '<?xml version="1.0" encoding="UTF-8"?>\n'
-                        "<candidate><candidate_id>C070</candidate_id><full_name>Janani Nagaraj</full_name>"
-                        "<email>janani@example.com</email><status>VERIFIED</status>"
-                        "<created_at>2026-11-05T10:15:00+00:00</created_at></candidate>"
-                    ),
-                },
+                "application/xml": XML_DOCS,
             },
         }
     },
+}
+
+GET_DOCS = {
+    "responses": {
+        "200": {
+            "description": "The candidate, as JSON or XML (choose with the Accept header or ?format=)",
+            "content": {
+                "application/json": {"schema": CandidateOut.model_json_schema()},
+                "application/xml": XML_DOCS,
+            },
+        }
+    }
 }
 
 
@@ -49,7 +82,7 @@ def _db_error(exc):
 def create_candidate(body: CandidateCreate, user=Depends(require_admin)):
     candidate_id = clean_candidate_id(body.candidate_id)
     try:
-        return store.create_candidate(candidate_id, body.full_name, body.email, body.status)
+        return store.create_candidate(candidate_id, body.full_name, body.email, body.phone_number, body.status)
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc))
     except Exception as exc:
@@ -64,20 +97,37 @@ def list_candidates(user=Depends(require_admin)):
         raise _db_error(exc)
 
 
-@router.get("/{candidate_id}", response_model=CandidateOut)
-def read_candidate(candidate_id: str, user=Depends(require_admin)):
+@router.get("/{candidate_id}", openapi_extra=GET_DOCS)
+def read_candidate(
+    candidate_id: str,
+    request: Request,
+    # Makes a "format" dropdown appear in Swagger (json / xml)
+    output_format: Optional[Literal["json", "xml"]] = Query(
+        None, alias="format", description="Output format (overrides the Accept header)"
+    ),
+    user=Depends(require_admin),
+):
     candidate_id = clean_candidate_id(candidate_id)
+    choose_format(request)
     try:
         found = store.get_candidate(candidate_id)
     except Exception as exc:
         raise _db_error(exc)
     if found is None:
         raise HTTPException(status_code=404, detail=f"Candidate '{candidate_id}' not found.")
-    return found
+    return build_response(request, found)
 
 
 @router.put("/{candidate_id}", openapi_extra=PUT_DOCS)
-async def update_candidate(candidate_id: str, request: Request, user=Depends(require_admin)):
+async def update_candidate(
+    candidate_id: str,
+    request: Request,
+    # Makes a "format" dropdown appear in Swagger (json / xml)
+    output_format: Optional[Literal["json", "xml"]] = Query(
+        None, alias="format", description="Output format (overrides the Accept header)"
+    ),
+    user=Depends(require_admin),
+):
     """Replace a candidate. Input: JSON only. Output: JSON (default) or XML.
 
     Choose the output with the Accept header (application/json or application/xml)
@@ -88,7 +138,7 @@ async def update_candidate(candidate_id: str, request: Request, user=Depends(req
     body = await read_candidate_update(request)
     try:
         updated = await run_in_threadpool(
-            store.update_candidate, candidate_id, body.full_name, body.email, body.status
+            store.update_candidate, candidate_id, body.full_name, body.email, body.phone_number, body.status
         )
     except Exception as exc:
         raise _db_error(exc)

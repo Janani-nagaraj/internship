@@ -1,6 +1,6 @@
 from app.db.connection import db_connect
 
-COLUMNS = "candidate_id, full_name, email, status, created_at"
+COLUMNS = "candidate_id, full_name, email, phone_number ,status, created_at"
 
 
 def _row_to_dict(row):
@@ -8,8 +8,9 @@ def _row_to_dict(row):
         "candidate_id": row[0],
         "full_name": row[1],
         "email": row[2],
-        "status": row[3],
-        "created_at": row[4],
+        "phone_number" : row[3],
+        "status": row[4],
+        "created_at": row[5],
     }
 
 
@@ -20,6 +21,7 @@ def _ensure_table(cur):
             candidate_id TEXT PRIMARY KEY,
             full_name    TEXT NOT NULL,
             email        TEXT NOT NULL,
+            phone_number TEXT NOT NULL,
             status       TEXT NOT NULL DEFAULT 'PENDING',
             created_at   TIMESTAMPTZ NOT NULL DEFAULT now()
         )
@@ -27,18 +29,18 @@ def _ensure_table(cur):
     )
 
 
-def create_candidate(candidate_id, full_name, email, status):
+def create_candidate(candidate_id, full_name, email,phone_number, status):
     with db_connect() as conn:
         with conn.cursor() as cur:
             _ensure_table(cur)
             cur.execute(
                 f"""
-                INSERT INTO candidates (candidate_id, full_name, email, status)
-                VALUES (%s, %s, %s, %s)
+                INSERT INTO candidates (candidate_id, full_name, email,phone_number, status)
+                VALUES (%s, %s, %s, %s,%s)
                 ON CONFLICT (candidate_id) DO NOTHING
                 RETURNING {COLUMNS}
                 """,
-                (candidate_id, full_name, email, status),
+                (candidate_id, full_name, email, phone_number,status),
             )
             row = cur.fetchone()
     if row is None:
@@ -63,17 +65,17 @@ def get_candidate(candidate_id):
     return _row_to_dict(row) if row else None
 
 
-def update_candidate(candidate_id, full_name, email, status):
+def update_candidate(candidate_id, full_name, email,phone_number,status):
     with db_connect() as conn:
         with conn.cursor() as cur:
             _ensure_table(cur)
             cur.execute(
                 f"""
-                UPDATE candidates SET full_name = %s, email = %s, status = %s
+                UPDATE candidates SET full_name = %s, email = %s, phone_number =%s, status = %s
                 WHERE candidate_id = %s
                 RETURNING {COLUMNS}
                 """,
-                (full_name, email, status, candidate_id),
+                (full_name, email,phone_number, status, candidate_id),
             )
             row = cur.fetchone()
     return _row_to_dict(row) if row else None

@@ -13,6 +13,7 @@ CREATE TABLE IF NOT EXISTS capstone.candidates (
     candidate_id TEXT PRIMARY KEY,
     full_name TEXT NOT NULL,
     email TEXT NOT NULL,
+    phone_number TEXT NOT NULL DEFAULT '',
     status TEXT NOT NULL DEFAULT 'PENDING'
         CHECK (status IN ('PENDING', 'VERIFIED', 'REJECTED')),
     created_at TIMESTAMPTZ NOT NULL DEFAULT now()
